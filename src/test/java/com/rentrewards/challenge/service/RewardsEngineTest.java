@@ -18,9 +18,11 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class RewardsEngineTest {
@@ -177,5 +179,102 @@ class RewardsEngineTest {
         } finally {
             executor.shutdownNow();
         }
+    }
+
+    @RepeatedTest(8)
+    void neverExceedsMonthlyCapWhenDistinctEventsArriveConcurrently() throws Exception {
+        int workerCount = 16;
+        RewardsEngine concurrentEngine = new RewardsEngine(
+                new PointsCalculator(), new ProcessedEventStore());
+        MemberAccount member = new MemberAccount("member-1", 0);
+        ExecutorService executor = Executors.newFixedThreadPool(workerCount);
+        CountDownLatch ready = new CountDownLatch(workerCount);
+        CountDownLatch start = new CountDownLatch(1);
+
+        try {
+            // Different payments for the same member racing on different workers.
+            // Any two of these 60,000-point payments together would exceed the cap,
+            // so the cap check and the award must happen as one step.
+            List<Future<PointsResult>> futures = new ArrayList<>();
+            for (int worker = 0; worker < workerCount; worker++) {
+                PaymentEvent event = new PaymentEvent(
+                        "evt-" + worker,
+                        "member-1",
+                        new BigDecimal("60000"),
+                        false,
+                        LocalDate.of(2026, 3, 1));
+                futures.add(executor.submit(() -> {
+                    ready.countDown();
+                    start.await();
+                    return concurrentEngine.processPayment(event, member);
+                }));
+            }
+
+            assertTrue(ready.await(2, TimeUnit.SECONDS));
+            start.countDown();
+
+            long totalAwarded = 0;
+            for (Future<PointsResult> future : futures) {
+                totalAwarded += future.get(2, TimeUnit.SECONDS).getPointsAwarded();
+            }
+
+            assertEquals(100_000, totalAwarded);
+            assertEquals(100_000, member.getPointsForMonth(YearMonth.of(2026, 3)));
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void reportsACappedEventAsDuplicateWhenItIsResentLater() {
+        MemberAccount member = new MemberAccount("member-1", 0);
+        PaymentEvent fillsCap = new PaymentEvent("evt-1", "member-1",
+                new BigDecimal("150000"), false, LocalDate.of(2026, 3, 1));
+        PaymentEvent capped = new PaymentEvent("evt-2", "member-1",
+                new BigDecimal("50"), false, LocalDate.of(2026, 3, 2));
+        PaymentEvent nextMonth = new PaymentEvent("evt-3", "member-1",
+                new BigDecimal("500"), false, LocalDate.of(2026, 4, 1));
+
+        // A capped event still counts as processed. Once another event has been
+        // handled in between, its redelivery must be skipped, not re-evaluated
+        // against the cap, so the dashboard shows it as a duplicate.
+        engine.processPayment(fillsCap, member);
+        PointsResult first = engine.processPayment(capped, member);
+        engine.processPayment(nextMonth, member);
+        PointsResult resent = engine.processPayment(capped, member);
+
+        assertEquals(ProcessingOutcome.CAPPED, first.getOutcome());
+        assertEquals(0, resent.getPointsAwarded());
+        assertEquals(ProcessingOutcome.DUPLICATE, resent.getOutcome());
+    }
+
+    @Test
+    void allowsARetryWhenProcessingFailsBeforePointsAreAwarded() {
+        // Simulates an unexpected error on the first delivery only.
+        PointsCalculator failsOnce = new PointsCalculator() {
+            private final AtomicBoolean failed = new AtomicBoolean();
+
+            @Override
+            public long calculateBasePoints(PaymentEvent event) {
+                if (failed.compareAndSet(false, true)) {
+                    throw new IllegalStateException("simulated processing failure");
+                }
+                return super.calculateBasePoints(event);
+            }
+        };
+        RewardsEngine flakyEngine = new RewardsEngine(failsOnce, new ProcessedEventStore());
+        MemberAccount member = new MemberAccount("member-1", 0);
+        PaymentEvent event = new PaymentEvent("evt-1", "member-1",
+                new BigDecimal("1500"), false, LocalDate.of(2026, 3, 1));
+
+        assertThrows(IllegalStateException.class,
+                () -> flakyEngine.processPayment(event, member));
+        PointsResult retry = flakyEngine.processPayment(event, member);
+
+        // A failed attempt must not consume the eventId, or the processor's
+        // retry would be skipped and the member would never be credited.
+        assertEquals(1500, retry.getPointsAwarded());
+        assertEquals(ProcessingOutcome.AWARDED, retry.getOutcome());
+        assertEquals(1500, member.getPointsForMonth(YearMonth.of(2026, 3)));
     }
 }
