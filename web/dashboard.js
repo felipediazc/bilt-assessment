@@ -6,16 +6,41 @@ const toneClasses = {
 
 const numberFormatter = new Intl.NumberFormat("en-US");
 
+const statusByOutcome = {
+  AWARDED: (result) => ({
+    title: `${numberFormatter.format(result.pointsAwarded)} points credited`,
+    description: "Your rent payment was processed successfully.",
+    tone: "success",
+  }),
+  DUPLICATE: () => ({
+    title: "Duplicate event skipped",
+    description:
+      "This payment was already processed, so no additional points were credited.",
+    tone: "neutral",
+  }),
+  CAPPED: (result, member) => ({
+    title: "Monthly cap reached",
+    description: `You've earned the maximum of ${numberFormatter.format(member.monthlyCap)} points this month, so this payment didn't earn additional points.`,
+    tone: "warning",
+  }),
+};
+
+// Never announce a credit for an outcome the dashboard does not recognize.
+const unknownStatus = {
+  title: "Payment status unavailable",
+  description: "We couldn't confirm the points for this payment yet.",
+  tone: "neutral",
+};
+
 export function buildViewModel(result, member) {
   const progressPercent = Math.min(
     100,
     (member.pointsThisMonth / member.monthlyCap) * 100,
   );
+  const status = statusByOutcome[result.outcome]?.(result, member) ?? unknownStatus;
 
   return {
-    title: `${numberFormatter.format(result.pointsAwarded)} points credited`,
-    description: "Your rent payment was processed successfully.",
-    tone: "success",
+    ...status,
     progressPercent,
   };
 }

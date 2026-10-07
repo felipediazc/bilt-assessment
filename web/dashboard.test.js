@@ -40,3 +40,13 @@ test("shows when the member has reached the monthly cap", () => {
   assert.equal(view.tone, "warning");
   assert.equal(view.progressPercent, 100);
 });
+
+test("never announces a credit for an unrecognized outcome", () => {
+  const view = buildViewModel(
+    { pointsAwarded: 1_500, outcome: "UNKNOWN" },
+    member,
+  );
+
+  assert.equal(view.title, "Payment status unavailable");
+  assert.equal(view.tone, "neutral");
+});
